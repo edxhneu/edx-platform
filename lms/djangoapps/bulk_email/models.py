@@ -13,6 +13,7 @@ file and check it in at the same time as your model changes. To do that,
 """
 import logging
 import markupsafe
+
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.exceptions import ValidationError
@@ -23,9 +24,12 @@ from openedx.core.lib.html_to_text import html_to_text
 from openedx.core.lib.mail_utils import wrap_message
 
 from config_models.models import ConfigurationModel
+from student.roles import CourseStaffRole, CourseInstructorRole
 
 from xmodule_django.models import CourseKeyField
+
 from util.keyword_substitution import substitute_keywords_with_data
+from util.query import use_read_replica_if_available
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +73,17 @@ class Target(models.Model):
     class Meta(object):
         app_label = "bulk_email"
 
+    # base querysets, used by several child class in get_user
+    # TODO - need course_id for these
+    # staff_qset = CourseStaffRole(course_id).users_with_role()
+    # instructor_qset = CourseInstructorRole(course_id).users_with_role()
+    # staff_instructor_qset = (staff_qset | instructor_qset).distinct()
+    # enrollment_qset = User.objects.filter(
+    #    is_active=True,
+    #    courseenrollment__course_id=course_id,
+    #    courseenrollment__is_active=True
+    # )
+
     def __unicode__(self):
         return "CourseEmail BaseTarget: {}".format(self.target_type)
 
@@ -88,6 +103,12 @@ class MyselfTarget(Target):
     def __unicode__(self):
         return "CourseEmail MyselfTarget"
 
+    def get_users(self, user_id=None):
+        if user_id is None:
+            raise ValueError("Must define self user to send email to self.")
+        user = User.objects.filter(id=user_id)
+        return use_read_replica_if_available(user)
+
 
 class StaffTarget(Target):
     """
@@ -104,6 +125,9 @@ class StaffTarget(Target):
     def __unicode__(self):
         return "CourseEmail StaffTarget"
 
+    def get_users(self):
+        return use_read_replica_if_available(self.staff_instructor_qset)
+
 
 class LearnersTarget(Target):
     """
@@ -119,6 +143,9 @@ class LearnersTarget(Target):
 
     def __unicode__(self):
         return "CourseEmail LearnersTarget"
+
+    def get_users(self):
+        return use_read_replica_if_available(enrollment_qset.exclude(staff_instructor_qset)),
 
 
 class CohortTarget(Target):
@@ -137,41 +164,52 @@ class CohortTarget(Target):
     def __unicode__(self):
         return "CourseEmail CohortTarget: {}".format(self.cohort.id)
 
-    @classmethod
-    def ensure_valid_cohort(cls, cohort_name, course_id):
-        """
-        Ensures cohort_name is a valid cohort for course_id.
+    def get_users(self):
+        return cohort.users
 
-        Returns the cohort if valid, raises an error otherwise.
-        """
-        if cohort_name is None:
-            raise ValueError("Cannot create a CohortTarget without specifying a cohort_name.")
-        try:
-            cohort = CourseUserGroup.get(name=cohort_name, course_id=course_id)
-        except CourseUserGroup.DoesNotExist:
-            raise ValueError(
-                "Cohort {cohort} does not exist in course {course_id}".format(
-                    cohort=cohort_name,
-                    course_id=course_id
-                )
+@classmethod
+def ensure_valid_cohort(cls, cohort_name, course_id):
+    """
+    Ensures cohort_name is a valid cohort for course_id.
+
+    Returns the cohort if valid, raises an error otherwise.
+    """
+    if cohort_name is None:
+        raise ValueError("Cannot create a CohortTarget without specifying a cohort_name.")
+    try:
+        cohort = CourseUserGroup.get(name=cohort_name, course_id=course_id)
+    except CourseUserGroup.DoesNotExist:
+        raise ValueError(
+            "Cohort {cohort} does not exist in course {course_id}".format(
+                cohort=cohort_name,
+                course_id=course_id
             )
-        return cohort
+        )
+    return cohort
 
 
 class AllTarget(Target):
-    """
-    Subclass of Target containing logic specific to all recipients.
-    """
-    class Meta:
-        proxy = True  # use the base Target table, this class only changes python functionality
-        app_label = "bulk_email"
+"""
+Subclass of Target containing logic specific to all recipients.
+"""
+class Meta:
+    proxy = True  # use the base Target table, this class only changes python functionality
+    app_label = "bulk_email"
 
-    def __init__(self, *args, **kwargs):
-        kwargs['target_type'] = SEND_TO_ALL
-        super(AllTarget, self).__init__(*args, **kwargs)
+def __init__(self, *args, **kwargs):
+    kwargs['target_type'] = SEND_TO_ALL
+    super(AllTarget, self).__init__(*args, **kwargs)
 
     def __unicode__(self):
         return "CourseEmail AllTarget"
+
+    def get_users(self):
+        # Return both learners and staff
+        recipient_qsets = [
+            use_read_replica_if_available(staff_instructor_qset),
+            use_read_replica_if_available(enrollment_qset),
+        ]
+        return recipient_qsets
 
 
 EMAIL_TARGET_CLASSES = [MyselfTarget, StaffTarget, LearnersTarget, CohortTarget, AllTarget]
